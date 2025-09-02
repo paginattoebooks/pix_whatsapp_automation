@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: paginatto-pix-pending
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: ZAPI_INSTANCE
+        sync: false
+      - key: ZAPI_TOKEN
+        sync: false
+      - key: ZAPI_CLIENT_TOKEN
+        sync: false
+      - key: WHATSAPP_SENDER_NAME
+        value: paginatto
+      - key: MSG_TEMPLATE
+        value: "Oi {name}, aqui é {brand}. Vi que você gerou um PIX do produto {product} no valor de {price} e não finalizou. Se precisar, posso te ajudar. Seu link: {checkout_url}"
