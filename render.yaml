@@ -19,6 +19,5 @@ services:
       - key: WHATSAPP_SENDER_NAME
         value: paginatto
       - key: MSG_TEMPLATE
-        value: "Oi {name}, aqui é {brand}. Vi que você gerou um PIX do produto {product} no valor de {price} e não finalizou. Se precisar, posso te ajudar. Seu link: {checkout_url}"
-
+        sync: false
 
