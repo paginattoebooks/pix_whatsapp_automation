@@ -16,4 +16,11 @@ services:
       - key: WHATSAPP_SENDER_NAME
         value: paginatto
       - key: MSG_TEMPLATE
+      - key: CARGO_HOME
+        value: /tmp/cargo
+      - key: RUSTUP_HOME
+        value: /tmp/rustup
+      - key: PIP_PREFER_BINARY
+        value: "1"
+
         value: "Oi {name}, aqui é {brand}. Vi que você gerou um PIX do produto {product} no valor de {price} e não finalizou. Se precisar, posso te ajudar. Seu link: {checkout_url}"
