@@ -2,7 +2,6 @@ services:
   - type: web
     name: paginatto-pix-pending
     env: python
-    pythonVersion: 3.11
     plan: free
     buildCommand: |
       export CARGO_HOME=/tmp/cargo
@@ -20,5 +19,6 @@ services:
       - key: WHATSAPP_SENDER_NAME
         value: paginatto
       - key: MSG_TEMPLATE
-        value: "Olha voce aí {name}! Vi que você gerou um PIX do produto {product} no valor de {price} e não finalizou. Se precisar, posso te ajudar. Seu link: {checkout_url}"
+        value: "Oi {name}, aqui é {brand}. Vi que você gerou um PIX do produto {product} no valor de {price} e não finalizou. Se precisar, posso te ajudar. Seu link: {checkout_url}"
+
 
