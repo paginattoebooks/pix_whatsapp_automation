@@ -4,7 +4,7 @@ services:
     env: python
     pythonVersion: 3.11
     plan: free
-   buildCommand: pip install -U pip setuptools wheel && pip install -r requirements.txt
+    buildCommand: CARGO_HOME=/tmp/cargo RUSTUP_HOME=/tmp/rustup PIP_PREFER_BINARY=1 PIP_ONLY_BINARY=:all: pip install -U pip setuptools wheel && pip install --only-binary=:all: -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: ZAPI_INSTANCE
