@@ -99,7 +99,8 @@ def render_message(customer: CartPandaCustomer, product: CartPandaProduct) -> st
     brand = WHATSAPP_SENDER_NAME or "sua loja"
     price = f"R$ {product.price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if product and product.price else "o valor informado"
     product_name = (product.title or "seu produto").strip()
-    checkout_url = (product.checkout_url or "").strip() or "https://seu-checkout.aqui"
+    checkout_url: order.get("checkout_link") or order.get("checkout_url"),
+
 
     return MSG_TEMPLATE.format(
         name=name,
@@ -188,7 +189,7 @@ async def cartpanda_webhook(req: Request):
       "payment_status": "pending" | "paid",
       "gateway": "pix",
       "customer": {"name":"...", "phone":"+55..." },
-      "product": {"title":"...", "price": 9.9, "checkout_url":"..." }
+      "product": {"title":"...", "price": 9.9, "checkout_link":"..." }
     }
     """
     try:
