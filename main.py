@@ -1,225 +1,143 @@
-# main.py
+# main.py  —  PIX pendente (checkout)
+
 import os
 import logging
-from typing import Optional, Dict, Any
-from datetime import datetime, timezone, timedelta
-
-import httpx
-from fastapi import FastAPI, Request, HTTPException
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.executors.pool import ThreadPoolExecutor
-from apscheduler.jobstores.memory import MemoryJobStore
+import httpx
 
-# -------------------- Logging --------------------
+# -------- Log --------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("pix-pending")
+log = logging.getLogger("paginatto-pix")
 
-# -------------------- Env --------------------
-ZAPI_INSTANCE = os.getenv("ZAPI_INSTANCE", "").strip()
-ZAPI_TOKEN = os.getenv("ZAPI_TOKEN", "").strip()
-ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN", "").strip()  # if your Z-API needs it
-WHATSAPP_SENDER_NAME = os.getenv("WHATSAPP_SENDER_NAME", "paginatto").strip()
-MSG_TEMPLATE = os.getenv(
+# -------- Env --------
+ZAPI_INSTANCE: str = os.getenv("ZAPI_INSTANCE", "")
+ZAPI_TOKEN: str = os.getenv("ZAPI_TOKEN", "")
+ZAPI_CLIENT_TOKEN: str = os.getenv("ZAPI_CLIENT_TOKEN", "")
+WHATSAPP_SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
+
+MSG_TEMPLATE: str = os.getenv(
     "MSG_TEMPLATE",
-    "Oi {name}, aqui é {brand}. Vi que você gerou um PIX do produto {product} no valor de {price} e não finalizou. "
-    "Se precisar, posso te ajudar. Seu link: {checkout_url}"
-).strip()
+    "Oi {name}! Seu pedido via PIX de {product} no valor de {price} está aguardando pagamento. "
+    "Pague aqui: {checkout_url}"
+)
 
-ZAPI_BASE_URL = os.getenv("ZAPI_BASE_URL", "").strip()
-# If empty, code will try two common Z-API URL patterns.
+ZAPI_URL: str = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
 
-# -------------------- FastAPI --------------------
-app = FastAPI(title="CartPanda PIX Pending → WhatsApp", version="1.0.0")
+app = FastAPI(title="Paginatto - PIX pendente", version="1.0.0")
 
-# -------------------- APScheduler --------------------
-jobstores = {"default": MemoryJobStore()}
-executors = {"default": ThreadPoolExecutor(10)}
-scheduler = BackgroundScheduler(jobstores=jobstores, executors=executors, timezone="UTC")
-scheduler.start()
+# -------- Helpers --------
+def normalize_phone(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return None
+    if digits.startswith("55"):
+        return digits
+    if len(digits) >= 10:
+        return "55" + digits
+    return None
 
-# Keep a minimal in-memory map for quick dedup or payload storage if needed.
-# On ephemeral hosts this is fine for MVP. For production, move to Redis/DB.
-PENDING_ORDERS: Dict[str, Dict[str, Any]] = {}
+async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
+    headers = {"Client-Token": ZAPI_CLIENT_TOKEN}
+    payload = {"phone": phone, "message": message}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(ZAPI_URL, headers=headers, json=payload)
+        return {"status": r.status_code, "body": r.text}
 
-# -------------------- Models --------------------
-class CartPandaCustomer(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None  # E.164 preferred
-    email: Optional[str] = None
+def safe_format(template: str, **kwargs) -> str:
+    """Não quebra se faltar placeholder."""
+    class _Safe(dict):
+        def __missing__(self, k): return "{" + k + "}"
+    return template.format_map(_Safe(**kwargs))
 
-class CartPandaProduct(BaseModel):
-    title: Optional[str] = None
-    price: Optional[float] = None
-    checkout_url: Optional[str] = Field(default=None, description="Direct checkout URL if provided")
+# -------- Parser (pedido/checkout) --------
+def parse_order(payload: dict) -> dict:
+    # alguns webhooks vêm como {"order": {...}}, outros como {"data": {...}} ou direto
+    order = payload.get("order") or payload.get("data") or payload
+    if not isinstance(order, dict):
+        order = {}
 
-class CartPandaPayload(BaseModel):
-    order_id: str
-    payment_status: str  # "pending" | "paid" | others
-    gateway: Optional[str] = None  # e.g., "pix"
-    customer: Optional[CartPandaCustomer] = None
-    product: Optional[CartPandaProduct] = None
+    customer = order.get("customer") or {}
+    items = order.get("items") or [{}]
 
-# -------------------- Helpers --------------------
-def _pick_zapi_send_url() -> str:
-    """
-    Return a Z-API send-text endpoint.
-    If ZAPI_BASE_URL is set, use it as the full URL.
-    Otherwise try common patterns.
-    """
-    if ZAPI_BASE_URL:
-        return ZAPI_BASE_URL
-
-    # Common Z-API Cloud pattern (adjust if your panel shows a different path)
-    # Example documented pattern:
-    candidates = [
-        f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text",
-        f"https://{ZAPI_INSTANCE}.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text",
-    ]
-    return candidates[0]
-
-async def send_whatsapp_text(to_phone: str, text: str) -> httpx.Response:
-    url = _pick_zapi_send_url()
-    payload = {
-        "phone": to_phone,
-        "message": text,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        # Some Z-API variants require a client token header. If yours does, uncomment:
-        # "Client-Token": ZAPI_CLIENT_TOKEN,
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        return resp
-
-def render_message(customer: CartPandaCustomer, product: CartPandaProduct) -> str:
-    name = (customer.name or "").strip() or "cliente"
-    brand = WHATSAPP_SENDER_NAME or "sua loja"
-    price = f"R$ {product.price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if product and product.price else "o valor informado"
-    product_name = (product.title or "seu produto").strip()
-    checkout_url: order.get("checkout_link") or order.get("checkout_url"),
-
-
-    return MSG_TEMPLATE.format(
-        name=name,
-        brand=brand,
-        price=price,
-        product=product_name,
-        checkout_url=checkout_url
+    # link de pagamento/checkout (garante os 3 nomes)
+    checkout_url = (
+        order.get("checkout_url")
+        or order.get("checkout_link")
+        or payload.get("checkout_url")
+        or payload.get("checkout_link")
+        or ""
     )
 
-def schedule_whatsapp_job(order_id: str, payload: CartPandaPayload, minutes: int = 5) -> None:
-    # Store payload for potential cancellation logic or debugging
-    PENDING_ORDERS[order_id] = payload.dict()
-    run_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    job_id = f"pix_pending_{order_id}"
+    # produto/preço
+    product_title = (items[0] or {}).get("title") or "Seu produto"
+    price = (items[0] or {}).get("price")
+    if isinstance(price, (int, float)):
+        price = f"R$ {price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    # Remove any previous job with same id to keep idempotency
-    try:
-        scheduler.remove_job(job_id)
-    except Exception:
-        pass
-
-    scheduler.add_job(
-        func=execute_send_whatsapp_job,
-        trigger="date",
-        run_date=run_at,
-        id=job_id,
-        kwargs={"order_id": order_id},
-        replace_existing=True,
-        misfire_grace_time=300,
-        coalesce=True,
-        max_instances=1,
+    # nome
+    name = (
+        customer.get("name")
+        or customer.get("full_name")
+        or customer.get("first_name")
+        or "cliente"
     )
-    log.info(f"[schedule] job={job_id} at={run_at.isoformat()}")
 
-def cancel_whatsapp_job(order_id: str) -> bool:
-    job_id = f"pix_pending_{order_id}"
-    try:
-        scheduler.remove_job(job_id)
-        PENDING_ORDERS.pop(order_id, None)
-        log.info(f"[cancel] job={job_id} canceled")
-        return True
-    except Exception as e:
-        log.info(f"[cancel] job={job_id} not found or already executed: {e}")
-        return False
-
-async def execute_send_whatsapp_job(order_id: str) -> None:
-    data = PENDING_ORDERS.pop(order_id, None)
-    if not data:
-        log.info(f"[execute] order_id={order_id} no payload found. Possibly already canceled.")
-        return
-
-    try:
-        payload = CartPandaPayload(**data)
-    except Exception as e:
-        log.error(f"[execute] invalid payload for order_id={order_id}: {e}")
-        return
-
-    # If payment status flipped to paid somehow, skip.
-    if payload.payment_status.lower() == "paid":
-        log.info(f"[execute] order_id={order_id} already paid. Skipping send.")
-        return
-
-    # Require phone to proceed
-    to_phone = (payload.customer.phone or "").strip() if payload.customer else ""
-    if not to_phone:
-        log.info(f"[execute] order_id={order_id} no phone. Skipping send.")
-        return
-
-    text = render_message(payload.customer or CartPandaCustomer(), payload.product or CartPandaProduct())
-    resp = await send_whatsapp_text(to_phone, text)
-
-    ok = resp.status_code in (200, 201, 202)
-    log.info(f"[execute] order_id={order_id} sent={ok} status={resp.status_code} body={resp.text}")
-
-# -------------------- Routes --------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
-
-@app.post("/webhook/cartpanda")
-async def cartpanda_webhook(req: Request):
-    """
-    Accepts events from CartPanda. Minimum fields expected:
-    {
-      "order_id": "123",
-      "payment_status": "pending" | "paid",
-      "gateway": "pix",
-      "customer": {"name":"...", "phone":"+55..." },
-      "product": {"title":"...", "price": 9.9, "checkout_link":"..." }
+    return {
+        "order_id": order.get("id"),
+        "status": order.get("status"),
+        "payment_status": order.get("payment_status"),
+        "payment_method": order.get("payment_method"),
+        "checkout_url": order.get("checkout_url") or order.get("checkout_link") or order.get("cart_url"),
+        "name": name,
+        "phone": customer.get("phone"),
+        "product": product_title,
+        "price": price or "R$ 0,00",
     }
-    """
-    try:
-        raw = await req.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    try:
-        payload = CartPandaPayload(**raw)
-    except Exception as e:
-        log.error(f"[webhook] validation error: {e}")
-        raise HTTPException(status_code=422, detail=f"Invalid payload: {e}")
+# -------- Webhook --------
+@app.post("/webhook/pixpendente")
+async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
+    log.info(f"[PIX] Webhook recebido: {payload}")
 
-    order_id = payload.order_id
-    status = payload.payment_status.lower()
-    gateway = (payload.gateway or "").lower()
+    info = parse_order(payload)
+    event = (payload.get("event") or info.get("status") or "").lower()
 
-    # Only care about PIX pending/paid
-    if gateway and gateway != "pix":
-        return JSONResponse({"ignored": True, "reason": "not pix", "order_id": order_id})
+    payment_method = (info.get("payment_method") or "").lower()
+    payment_status = (info.get("payment_status") or "").lower()
 
-    if status == "pending":
-        schedule_whatsapp_job(order_id, payload, minutes=5)
-        return JSONResponse({"scheduled": True, "order_id": order_id, "in_minutes": 5})
+    is_pix = payment_method.startswith("pix")
+    is_pending = payment_status in {"pending", "pendente", "aguardando"}
 
-    if status == "paid":
-        canceled = cancel_whatsapp_job(order_id)
-        return JSONResponse({"canceled": canceled, "order_id": order_id})
+    # Também trata 'order.created' com status pendente
+    trigger = is_pix and (is_pending or "order.created" in event)
 
-    return JSONResponse({"ignored": True, "reason": f"status={status}", "order_id": order_id})
+    if not trigger:
+        log.info(f"[{info.get('order_id')}] ignorado (event={event}, method={payment_method}, status={payment_status})")
+        return JSONResponse({"ok": True, "action": "ignored", "order_id": info.get("order_id")})
 
-# -------------------- Local dev --------------------
-# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
+    phone = normalize_phone(info.get("phone"))
+    if not phone:
+        log.warning(f"[{info.get('order_id')}] telefone inválido -> não enviou")
+        return JSONResponse({"ok": False, "error": "telefone inválido", "order_id": info.get("order_id")})
+
+    msg = safe_format(
+        MSG_TEMPLATE,
+        name=info.get("name", "cliente"),
+        product=info.get("product", "seu produto"),
+        price=info.get("price", "R$ 0,00"),
+        checkout_url=info.get("checkout_url", "#"),
+        brand=WHATSAPP_SENDER_NAME,
+    )
+
+    result = await send_whatsapp(phone, msg)
+    log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
+    return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id")})
+
+# -------- Health --------
+@app.get("/health")
+async def health():
+    return {"ok": True, "serviço": "paginatto-pix", "versão": "1.0.0"}
