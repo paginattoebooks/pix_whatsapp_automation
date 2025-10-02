@@ -1,4 +1,4 @@
-# main.py  —  PIX pendente (checkout)
+# main.py — PIX pendente (checkout)
 
 import os
 import logging
@@ -40,6 +40,22 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
         return "55" + digits
     return None
 
+def brl(value) -> str:
+    if value is None:
+        return "R$ 0,00"
+    try:
+        # admite string numérica, inteiro em centavos, etc.
+        if isinstance(value, str):
+            v = float(value.replace(",", "."))
+        else:
+            v = float(value)
+        # heurística simples: inteiros grandes provavelmente estão em centavos
+        if isinstance(value, int) and value >= 1000:
+            v = v / 100.0
+        return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(value)
+
 async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
     headers = {"Client-Token": ZAPI_CLIENT_TOKEN}
     payload = {"phone": phone, "message": message}
@@ -48,7 +64,6 @@ async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
         return {"status": r.status_code, "body": r.text}
 
 def safe_format(template: str, **kwargs) -> str:
-    """Não quebra se faltar placeholder."""
     class _Safe(dict):
         def __missing__(self, k): return "{" + k + "}"
     return template.format_map(_Safe(**kwargs))
@@ -61,24 +76,36 @@ def parse_order(payload: dict) -> dict:
         order = {}
 
     customer = order.get("customer") or {}
-    items = order.get("items") or [{}]
+    items = order.get("line_items") or order.get("items") or []
 
-    # link de pagamento/checkout (garante os 3 nomes)
+    first = items[0] if items else {}
+
+    # Produto: name > title + variant_title > title
+    title = (first or {}).get("title")
+    variant_title = (first or {}).get("variant_title")
+    product_name = (first or {}).get("name") or (
+        f"{title} {variant_title}".strip() if title and variant_title else title
+    ) or "Seu produto"
+
+    # Preço: tenta do item, senão do pedido
+    raw_price = (first or {}).get("price") \
+        or order.get("total_price") \
+        or order.get("unformatted_total_price")
+
+    price_fmt = brl(raw_price)
+
+    # link de pagamento/checkout (garante os 3 nomes + nível raiz do payload)
     checkout_url = (
         order.get("checkout_url")
         or order.get("checkout_link")
+        or order.get("cart_url")
         or payload.get("checkout_url")
         or payload.get("checkout_link")
+        or payload.get("cart_url")
         or ""
     )
 
-    # produto/preço
-    product_title = (items[0] or {}).get("title") or "Seu produto"
-    price = (items[0] or {}).get("price")
-    if isinstance(price, (int, float)):
-        price = f"R$ {price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-    # nome
+    # nome do cliente
     name = (
         customer.get("name")
         or customer.get("full_name")
@@ -88,14 +115,14 @@ def parse_order(payload: dict) -> dict:
 
     return {
         "order_id": order.get("id"),
-        "status": order.get("status"),
-        "payment_status": order.get("payment_status"),
-        "payment_method": order.get("payment_method"),
-        "checkout_url": order.get("checkout_url") or order.get("checkout_link") or order.get("cart_url"),
+        "status": (order.get("status") or "").lower(),
+        "payment_status": (order.get("payment_status") or "").lower(),
+        "payment_method": (order.get("payment_method") or "").lower(),
+        "checkout_url": checkout_url,
         "name": name,
         "phone": customer.get("phone"),
-        "product": product_title,
-        "price": price or "R$ 0,00",
+        "product": product_name,
+        "price": price_fmt,
     }
 
 # -------- Webhook --------
@@ -106,15 +133,14 @@ async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
     info = parse_order(payload)
     event = (payload.get("event") or info.get("status") or "").lower()
 
-    payment_method = (info.get("payment_method") or "").lower()
-    payment_status = (info.get("payment_status") or "").lower()
+    payment_method = info.get("payment_method", "")
+    payment_status = info.get("payment_status", "")
 
     is_pix = payment_method.startswith("pix")
     is_pending = payment_status in {"pending", "pendente", "aguardando"}
 
-    # Também trata 'order.created' com status pendente
+    # Também aceita 'order.created' com status pendente
     trigger = is_pix and (is_pending or "order.created" in event)
-
     if not trigger:
         log.info(f"[{info.get('order_id')}] ignorado (event={event}, method={payment_method}, status={payment_status})")
         return JSONResponse({"ok": True, "action": "ignored", "order_id": info.get("order_id")})
@@ -138,12 +164,6 @@ async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
     return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id")})
 
 # -------- Health --------
-# --- após seus imports / depois de app = FastAPI() ---
-
-# se ainda não tiver:
-# from fastapi import FastAPI
-# app = FastAPI()
-
 @app.get("/")
 def root():
     return {"ok": True, "service": "pix-whatsapp-automation"}
@@ -151,3 +171,4 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
