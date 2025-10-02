@@ -138,6 +138,16 @@ async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
     return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id")})
 
 # -------- Health --------
+# --- após seus imports / depois de app = FastAPI() ---
+
+# se ainda não tiver:
+# from fastapi import FastAPI
+# app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "pix-whatsapp-automation"}
+
 @app.get("/health")
-async def health():
-    return {"ok": True, "serviço": "paginatto-pix", "versão": "1.0.0"}
+def health():
+    return {"ok": True}
