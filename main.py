@@ -1,18 +1,22 @@
-# main.py — PIX pendente (checkout)
+# main.py — PIX pendente (controle de 5 minutos, Render)
 
 import os
 import logging
+import asyncio
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, Body, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse, Response
 import httpx
 
-# -------- Log --------
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# ---------------- Log ----------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("paginatto-pix")
 
-# -------- Env --------
+# ---------------- Env ----------------
 ZAPI_INSTANCE: str = os.getenv("ZAPI_INSTANCE", "")
 ZAPI_TOKEN: str = os.getenv("ZAPI_TOKEN", "")
 ZAPI_CLIENT_TOKEN: str = os.getenv("ZAPI_CLIENT_TOKEN", "")
@@ -20,16 +24,25 @@ WHATSAPP_SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
 
 MSG_TEMPLATE: str = os.getenv(
     "MSG_TEMPLATE",
-    "Oi {name}! Seu pedido via PIX de {product} no valor de {price} está aguardando pagamento. "
-    "Pague aqui: {checkout_url}"
+    "Oi {name}! Seu pedido via PIX de {product} no valor de {price} "
+    "ainda está aguardando pagamento. Se quiser concluir, é só pagar aqui: {checkout_url}"
 )
 
-ZAPI_URL: str = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
+ZAPI_URL: str = (
+    f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
+)
 
-app = FastAPI(title="Paginatto - PIX pendente", version="1.0.0")
+# ---------------- FastAPI & Scheduler ----------------
+app = FastAPI(title="Paginatto - PIX pendente", version="2.0.0")
+
+# Scheduler em background (funciona bem em Render / processo sempre ligado)
+scheduler = BackgroundScheduler(timezone="UTC")
+
+# guarda pedidos que já foram pagos (pra não mandar msg)
+paid_orders = set()
 
 
-# -------- Helpers --------
+# ---------------- Helpers ----------------
 def normalize_phone(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
@@ -44,52 +57,38 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
 
 
 def brl(value) -> str:
-    """
-    Converte diferentes formatos de valor para BRL:
-    - número simples (ex: 37.9, 3790)
-    - string "37.9" ou "37,90"
-    - dict {"amount": 3790} ou {"value": 37.9}
-    """
     if value is None:
         return "R$ 0,00"
-
     try:
-        # Se vier como dict (muito comum em gateways)
+        # aceita string numérica, inteiro em centavos, etc.
         if isinstance(value, dict):
-            for key in ("amount", "value", "price", "total", "subtotal"):
-                if key in value:
-                    value = value[key]
-                    break
+            # tenta pegar chaves comuns, se vier algo tipo {"amount": 2089}
+            value = (
+                value.get("amount")
+                or value.get("value")
+                or value.get("price")
+                or value
+            )
 
-        # String -> float
         if isinstance(value, str):
-            # trata formatos tipo "1.234,56"
-            if "," in value and "." in value:
-                value = value.replace(".", "").replace(",", ".")
-            else:
-                value = value.replace(",", ".")
-            v = float(value)
+            v = float(value.replace(",", "."))
         else:
             v = float(value)
 
-        # Heurística: inteiros grandes provavelmente são centavos
+        # heurística simples: inteiros grandes provavelmente estão em centavos
         if isinstance(value, int) and value >= 1000:
             v = v / 100.0
 
         return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
-        log.exception(f"Erro ao formatar valor para BRL: {value!r}")
-        return "R$ 0,00"
+        return str(value)
 
 
 def to_lower(value: Any) -> str:
-    """
-    Converte QUALQUER coisa pra string minúscula sem quebrar.
-    Até se vier int, bool, etc.
-    """
+    if value is None:
+        return ""
     try:
-        s = str(value)
-        return s.lower()
+        return str(value).strip().lower()
     except Exception:
         return ""
 
@@ -97,13 +96,12 @@ def to_lower(value: Any) -> str:
 async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
     headers = {"Client-Token": ZAPI_CLIENT_TOKEN}
     payload = {"phone": phone, "message": message}
-
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(ZAPI_URL, headers=headers, json=payload)
-        return {"status": r.status_code, "body": r.text}
-    except httpx.RequestError as e:
-        log.exception(f"Erro ao enviar mensagem para Z-API: {e}")
+            return {"status": r.status_code, "body": r.text}
+    except Exception as e:
+        log.exception(f"Erro ao enviar WhatsApp para {phone}: {e}")
         return {"status": "error", "body": str(e)}
 
 
@@ -115,25 +113,26 @@ def safe_format(template: str, **kwargs) -> str:
     return template.format_map(_Safe(**kwargs))
 
 
-# -------- Parser (pedido/checkout) --------
+# ---------------- Parser (pedido/checkout) ----------------
 def parse_order(payload: dict) -> dict:
-    if not isinstance(payload, dict):
-        log.warning(f"Payload não é dict, veio {type(payload)}: {payload!r}")
-        payload = {}
-
-    # alguns webhooks vêm como {"order": {...}}, outros como {"data": {...}} ou direto
+    """
+    Normaliza o JSON do CartPanda em um dict simples com:
+    - order_id
+    - status (New / Paid / etc.)
+    - payment_status (1, 3, "pending", etc.)
+    - payment_method (pix, boleto, card...)
+    - checkout_url
+    - name
+    - phone
+    - product
+    - price (formatado em BRL)
+    """
     order = payload.get("order") or payload.get("data") or payload
     if not isinstance(order, dict):
-        log.warning(f"Campo 'order/data' não é dict, veio {type(order)}: {order!r}")
         order = {}
 
     customer = order.get("customer") or {}
-    if not isinstance(customer, dict):
-        customer = {}
-
     items = order.get("line_items") or order.get("items") or []
-    if not isinstance(items, list):
-        items = []
 
     first = items[0] if items else {}
 
@@ -145,13 +144,16 @@ def parse_order(payload: dict) -> dict:
     ) or "Seu produto"
 
     # Preço: tenta do item, senão do pedido
-    raw_price = (first or {}).get("price") \
-        or order.get("total_price") \
-        or order.get("unformatted_total_price")
+    raw_price = (
+        (first or {}).get("price")
+        or order.get("total_price_in_decimal")
+        or order.get("total_price")
+        or order.get("subtotal_price")
+    )
 
     price_fmt = brl(raw_price)
 
-    # link de pagamento/checkout (garante os 3 nomes + nível raiz do payload)
+    # link de pagamento/checkout
     checkout_url = (
         order.get("checkout_url")
         or order.get("checkout_link")
@@ -162,18 +164,50 @@ def parse_order(payload: dict) -> dict:
         or ""
     )
 
+    # status geral do pedido (New, Paid etc.)
+    status = to_lower(order.get("status") or order.get("status_id"))
+
+    # ---- payment_status: pode vir em vários lugares ----
+    payment_status_raw = order.get("payment_status")
+
+    payment_block = order.get("payment")
+    if payment_status_raw is None and isinstance(payment_block, dict):
+        payment_status_raw = (
+            payment_block.get("status_id")
+            or payment_block.get("actual_status_id")
+        )
+
+    payment_status = to_lower(payment_status_raw)
+
+    # ---- payment_method: CartPanda usa "payment_type" e blocos de payment ----
+    method_raw = (
+        order.get("payment_method")
+        or order.get("payment_type")  # ex.: "pix"
+        or order.get("payment_gateway")  # ex.: "mercadopago"
+    )
+
+    if not method_raw and isinstance(payment_block, dict):
+        method_raw = (
+            payment_block.get("type")           # ex.: "pix"
+            or payment_block.get("payment_type")
+        )
+
+    all_payments = order.get("all_payments")
+    if not method_raw and isinstance(all_payments, list) and all_payments:
+        method_raw = all_payments[0].get("type")
+
+    payment_method = to_lower(method_raw)
+
     # nome do cliente
     name = (
         customer.get("name")
         or customer.get("full_name")
-        or customer.get("first_name")
+        or (customer.get("first_name") or "")
+        + (" " + customer.get("last_name") if customer.get("last_name") else "")
         or "cliente"
-    )
+    ).strip()
 
-    # status / payment_* podem vir como int, bool etc → força pra string
-    status = to_lower(order.get("status"))
-    payment_status = to_lower(order.get("payment_status"))
-    payment_method = to_lower(order.get("payment_method"))
+    phone = customer.get("phone") or order.get("phone")
 
     return {
         "order_id": order.get("id"),
@@ -182,83 +216,170 @@ def parse_order(payload: dict) -> dict:
         "payment_method": payment_method,
         "checkout_url": checkout_url,
         "name": name,
-        "phone": customer.get("phone"),
+        "phone": phone,
         "product": product_name,
         "price": price_fmt,
     }
 
 
-# -------- Webhook --------
+# ---------------- Job de 5 minutos ----------------
+def check_and_send_if_still_pending(
+    order_id: int,
+    name: str,
+    phone: str,
+    product: str,
+    price: str,
+    checkout_url: str,
+):
+    """
+    Roda 5 minutos depois do order.created (PIX).
+    Se o pedido ainda não foi marcado como pago, manda WhatsApp.
+    """
+
+    log.info(f"[{order_id}] job 5min iniciado para checar PIX pendente")
+
+    # 1) se já foi pago, não manda nada
+    if order_id in paid_orders:
+        log.info(f"[{order_id}] já foi pago antes dos 5 minutos; não envia mensagem.")
+        return
+
+    # 2) normaliza telefone
+    phone_norm = normalize_phone(phone)
+    if not phone_norm:
+        log.warning(f"[{order_id}] telefone inválido na checagem; não envia.")
+        return
+
+    # 3) monta mensagem
+    msg = safe_format(
+        MSG_TEMPLATE,
+        name=name or "cliente",
+        product=product or "seu produto",
+        price=price or "R$ 0,00",
+        checkout_url=checkout_url or "#",
+        brand=WHATSAPP_SENDER_NAME,
+    )
+
+    # 4) chama a função assíncrona de envio (scheduler roda em thread separada)
+    try:
+        result = asyncio.run(send_whatsapp(phone_norm, msg))
+        log.info(f"[{order_id}] WhatsApp (5min) -> {result}")
+    except Exception as e:
+        log.exception(f"[{order_id}] erro ao enviar WhatsApp pós-5min: {e}")
+
+
+# ---------------- Webhook ----------------
 @app.post("/webhook/pixpendente")
 @app.post("/webhook/cartpanda")
 async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
     log.info(f"[PIX] Webhook recebido: {payload}")
 
-    try:
-        info = parse_order(payload)
+    info = parse_order(payload)
 
-        # event pode vir como string, número ou até dict
-        event_raw = payload.get("event")
-        if isinstance(event_raw, dict):
-            event_raw = event_raw.get("type") or event_raw.get("name") or event_raw
-
-        event = to_lower(event_raw or info.get("status"))
-
-        payment_method = to_lower(info.get("payment_method"))
-        payment_status = to_lower(info.get("payment_status"))
-
-        is_pix = payment_method.startswith("pix")
-        is_pending = payment_status in {"pending", "pendente", "aguardando"}
-
-        # Também aceita 'order.created' com status pendente
-        trigger = is_pix and (is_pending or "order.created" in event)
-        if not trigger:
-            log.info(
-                f"[{info.get('order_id')}] ignorado "
-                f"(event={event}, method={payment_method}, status={payment_status})"
-            )
-            return JSONResponse(
-                {"ok": True, "action": "ignored", "order_id": info.get("order_id")}
-            )
-
-        phone = normalize_phone(info.get("phone"))
-        if not phone:
-            log.warning(f"[{info.get('order_id')}] telefone inválido -> não enviou")
-            return JSONResponse(
-                {"ok": False, "error": "telefone inválido", "order_id": info.get("order_id")}
-            )
-
-        msg = safe_format(
-            MSG_TEMPLATE,
-            name=info.get("name", "cliente"),
-            product=info.get("product", "seu produto"),
-            price=info.get("price", "R$ 0,00"),
-            checkout_url=info.get("checkout_url", "#"),
-            brand=WHATSAPP_SENDER_NAME,
+    # event pode vir em vários formatos
+    event_raw = payload.get("event")
+    if isinstance(event_raw, dict):
+        event_raw = (
+            event_raw.get("type")
+            or event_raw.get("name")
+            or event_raw
         )
+    event = to_lower(event_raw or info.get("status"))
 
-        result = await send_whatsapp(phone, msg)
-        log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
+    payment_method = to_lower(info.get("payment_method"))
+    payment_status = to_lower(info.get("payment_status"))
+    order_status = to_lower(info.get("status"))
+    order_id = info.get("order_id")
 
+    # -------- 1) Se virou pago, só marca e sai --------
+    # Aqui você pode ajustar os códigos conforme observar nos logs
+    is_paid = (
+        "order.paid" in event
+        or payment_status in {"paid", "pago", "3", "aprovado", "approved"}
+        or order_status in {"paid", "pago"}
+    )
+
+    if is_paid:
+        if order_id is not None:
+            paid_orders.add(order_id)
+        log.info(
+            f"[{order_id}] marcado como pago (event={event}, "
+            f"method={payment_method}, status={payment_status})"
+        )
         return JSONResponse(
             {
                 "ok": True,
-                "action": "whatsapp_sent",
-                "order_id": info.get("order_id"),
-                "whatsapp_result": result,
+                "action": "marked_paid",
+                "order_id": order_id,
             }
         )
 
-    except Exception as e:
-        # garante que nunca dê 500 pro CartPanda
-        log.exception(f"Erro ao processar webhook: {e}")
-        return JSONResponse(
-            {"ok": False, "action": "error", "error": str(e)},
-            status_code=200,
-        )
+    # -------- 2) Se for PIX e ainda pendente, agenda job pra 5min --------
+    is_pix = payment_method.startswith("pix")
+
+    # No CartPanda, pelo seu log, payment_status=1 é pendente / aguardando
+    is_pending = (
+        payment_status in {"pending", "pendente", "aguardando", "1", "0"}
+        or order_status in {"new", "open", "pending", "pendente", "aguardando"}
+    )
+
+    if is_pix and ("order.created" in event or is_pending):
+        # agenda checagem para daqui 5 minutos
+        run_at = datetime.utcnow() + timedelta(minutes=5)
+
+        try:
+            scheduler.add_job(
+                check_and_send_if_still_pending,
+                "date",
+                run_date=run_at,
+                id=f"pix_{order_id}",
+                replace_existing=True,
+                args=[
+                    order_id,
+                    info.get("name"),
+                    info.get("phone"),
+                    info.get("product"),
+                    info.get("price"),
+                    info.get("checkout_url"),
+                ],
+            )
+            log.info(
+                f"[{order_id}] PIX pendente detectado; job agendado para "
+                f"{run_at.isoformat()} UTC "
+                f"(event={event}, status={payment_status})"
+            )
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "action": "scheduled_5min_check",
+                    "order_id": order_id,
+                }
+            )
+        except Exception as e:
+            log.exception(f"[{order_id}] erro ao agendar job de 5min: {e}")
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "action": "schedule_error",
+                    "error": str(e),
+                    "order_id": order_id,
+                }
+            )
+
+    # -------- 3) Qualquer outra coisa é ignorada --------
+    log.info(
+        f"[{order_id}] ignorado "
+        f"(event={event}, method={payment_method}, status={payment_status})"
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "action": "ignored",
+            "order_id": order_id,
+        }
+    )
 
 
-# -------- Health / favicon --------
+# ---------------- Health & favicon ----------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "pix-whatsapp-automation"}
@@ -270,11 +391,15 @@ def health():
 
 
 @app.get("/favicon.ico")
-def favicon_ico():
-    return Response(status_code=204)
-
-
 @app.get("/favicon.png")
-def favicon_png():
+def favicon():
+    # só pra não ficar jogando 404 no log
     return Response(status_code=204)
 
+
+# ---------------- Startup do scheduler ----------------
+@app.on_event("startup")
+def _start_scheduler():
+    if not scheduler.running:
+        log.info("Iniciando scheduler em background...")
+        scheduler.start()
