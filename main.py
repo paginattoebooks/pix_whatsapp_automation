@@ -127,6 +127,7 @@ def parse_order(payload: dict) -> dict:
 
 # -------- Webhook --------
 @app.post("/webhook/pixpendente")
+@app.post("/webhook/cartpanda")
 async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
     log.info(f"[PIX] Webhook recebido: {payload}")
 
