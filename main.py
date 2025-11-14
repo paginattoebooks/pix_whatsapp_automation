@@ -3,6 +3,7 @@
 import os
 import logging
 from typing import Dict, Any, Optional
+
 from fastapi import FastAPI, Body, Response
 from fastapi.responses import JSONResponse
 import httpx
@@ -27,6 +28,7 @@ ZAPI_URL: str = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOK
 
 app = FastAPI(title="Paginatto - PIX pendente", version="1.0.0")
 
+
 # -------- Helpers --------
 def normalize_phone(raw: Optional[str]) -> Optional[str]:
     if not raw:
@@ -40,43 +42,83 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
         return "55" + digits
     return None
 
+
 def brl(value) -> str:
+    """
+    Converte diferentes formatos de valor para BRL:
+    - número simples (ex: 37.9, 3790)
+    - string "37.9" ou "37,90"
+    - dict {"amount": 3790} ou {"value": 37.9}
+    Evita quebrar o app se vier algo diferente.
+    """
     if value is None:
         return "R$ 0,00"
+
     try:
-        # admite string numérica, inteiro em centavos, etc.
+        # Se vier como dict (muito comum em gateways)
+        if isinstance(value, dict):
+            for key in ("amount", "value", "price", "total", "subtotal"):
+                if key in value:
+                    value = value[key]
+                    break
+
+        # String -> float
         if isinstance(value, str):
-            v = float(value.replace(",", "."))
+            v = float(value.replace(".", "").replace(",", ".")) if "," in value and "." in value else float(
+                value.replace(",", ".")
+            )
         else:
             v = float(value)
-        # heurística simples: inteiros grandes provavelmente estão em centavos
+
+        # Heurística: inteiros grandes provavelmente são centavos
         if isinstance(value, int) and value >= 1000:
             v = v / 100.0
+
         return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
-        return str(value)
+        log.exception(f"Erro ao formatar valor para BRL: {value!r}")
+        return "R$ 0,00"
+
 
 async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
     headers = {"Client-Token": ZAPI_CLIENT_TOKEN}
     payload = {"phone": phone, "message": message}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(ZAPI_URL, headers=headers, json=payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(ZAPI_URL, headers=headers, json=payload)
         return {"status": r.status_code, "body": r.text}
+    except httpx.RequestError as e:
+        log.exception(f"Erro ao enviar mensagem para Z-API: {e}")
+        return {"status": "error", "body": str(e)}
+
 
 def safe_format(template: str, **kwargs) -> str:
     class _Safe(dict):
-        def __missing__(self, k): return "{" + k + "}"
+        def __missing__(self, k): 
+            return "{" + k + "}"
     return template.format_map(_Safe(**kwargs))
+
 
 # -------- Parser (pedido/checkout) --------
 def parse_order(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        log.warning(f"Payload não é dict, veio {type(payload)}: {payload!r}")
+        payload = {}
+
     # alguns webhooks vêm como {"order": {...}}, outros como {"data": {...}} ou direto
     order = payload.get("order") or payload.get("data") or payload
     if not isinstance(order, dict):
+        log.warning(f"Campo 'order/data' não é dict, veio {type(order)}: {order!r}")
         order = {}
 
     customer = order.get("customer") or {}
+    if not isinstance(customer, dict):
+        customer = {}
+
     items = order.get("line_items") or order.get("items") or []
+    if not isinstance(items, list):
+        items = []
 
     first = items[0] if items else {}
 
@@ -125,57 +167,87 @@ def parse_order(payload: dict) -> dict:
         "price": price_fmt,
     }
 
+
 # -------- Webhook --------
 @app.post("/webhook/pixpendente")
 @app.post("/webhook/cartpanda")
 async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
     log.info(f"[PIX] Webhook recebido: {payload}")
 
-    info = parse_order(payload)
-    event = (payload.get("event") or info.get("status") or "").lower()
+    try:
+        info = parse_order(payload)
+        event = (payload.get("event") or info.get("status") or "").lower()
 
-    payment_method = info.get("payment_method", "")
-    payment_status = info.get("payment_status", "")
+        payment_method = info.get("payment_method", "")
+        payment_status = info.get("payment_status", "")
 
-    is_pix = payment_method.startswith("pix")
-    is_pending = payment_status in {"pending", "pendente", "aguardando"}
+        is_pix = payment_method.startswith("pix")
+        is_pending = payment_status in {"pending", "pendente", "aguardando"}
 
-    # Também aceita 'order.created' com status pendente
-    trigger = is_pix and (is_pending or "order.created" in event)
-    if not trigger:
-        log.info(f"[{info.get('order_id')}] ignorado (event={event}, method={payment_method}, status={payment_status})")
-        return JSONResponse({"ok": True, "action": "ignored", "order_id": info.get("order_id")})
+        # Também aceita 'order.created' com status pendente
+        trigger = is_pix and (is_pending or "order.created" in event)
+        if not trigger:
+            log.info(
+                f"[{info.get('order_id')}] ignorado "
+                f"(event={event}, method={payment_method}, status={payment_status})"
+            )
+            return JSONResponse(
+                {"ok": True, "action": "ignored", "order_id": info.get("order_id")}
+            )
 
-    phone = normalize_phone(info.get("phone"))
-    if not phone:
-        log.warning(f"[{info.get('order_id')}] telefone inválido -> não enviou")
-        return JSONResponse({"ok": False, "error": "telefone inválido", "order_id": info.get("order_id")})
+        phone = normalize_phone(info.get("phone"))
+        if not phone:
+            log.warning(f"[{info.get('order_id')}] telefone inválido -> não enviou")
+            return JSONResponse(
+                {"ok": False, "error": "telefone inválido", "order_id": info.get("order_id")}
+            )
 
-    msg = safe_format(
-        MSG_TEMPLATE,
-        name=info.get("name", "cliente"),
-        product=info.get("product", "seu produto"),
-        price=info.get("price", "R$ 0,00"),
-        checkout_url=info.get("checkout_url", "#"),
-        brand=WHATSAPP_SENDER_NAME,
-    )
+        msg = safe_format(
+            MSG_TEMPLATE,
+            name=info.get("name", "cliente"),
+            product=info.get("product", "seu produto"),
+            price=info.get("price", "R$ 0,00"),
+            checkout_url=info.get("checkout_url", "#"),
+            brand=WHATSAPP_SENDER_NAME,
+        )
 
-    result = await send_whatsapp(phone, msg)
-    log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
-    return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id")})
+        result = await send_whatsapp(phone, msg)
+        log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
 
-# -------- Health --------
+        return JSONResponse(
+            {
+                "ok": True,
+                "action": "whatsapp_sent",
+                "order_id": info.get("order_id"),
+                "whatsapp_result": result,
+            }
+        )
+
+    except Exception as e:
+        # garante que nunca dê 500 pro CartPanda
+        log.exception(f"Erro ao processar webhook: {e}")
+        return JSONResponse(
+            {"ok": False, "action": "error", "error": str(e)},
+            status_code=200,
+        )
+
+
+# -------- Health / favicon --------
 @app.get("/")
 def root():
     return {"ok": True, "service": "pix-whatsapp-automation"}
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 @app.get("/favicon.ico")
-def favicon():
-    # Responde 204 (sem conteúdo) só pra não dar 404 no log
+def favicon_ico():
     return Response(status_code=204)
 
 
+@app.get("/favicon.png")
+def favicon_png():
+    return Response(status_code=204)
