@@ -3,7 +3,7 @@
 import os
 import logging
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Response
 from fastapi.responses import JSONResponse
 import httpx
 
@@ -172,4 +172,10 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/favicon.ico")
+def favicon():
+    # Responde 204 (sem conteúdo) só pra não dar 404 no log
+    return Response(status_code=204)
+
 
