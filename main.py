@@ -49,7 +49,6 @@ def brl(value) -> str:
     - número simples (ex: 37.9, 3790)
     - string "37.9" ou "37,90"
     - dict {"amount": 3790} ou {"value": 37.9}
-    Evita quebrar o app se vier algo diferente.
     """
     if value is None:
         return "R$ 0,00"
@@ -64,9 +63,12 @@ def brl(value) -> str:
 
         # String -> float
         if isinstance(value, str):
-            v = float(value.replace(".", "").replace(",", ".")) if "," in value and "." in value else float(
-                value.replace(",", ".")
-            )
+            # trata formatos tipo "1.234,56"
+            if "," in value and "." in value:
+                value = value.replace(".", "").replace(",", ".")
+            else:
+                value = value.replace(",", ".")
+            v = float(value)
         else:
             v = float(value)
 
@@ -95,8 +97,9 @@ async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
 
 def safe_format(template: str, **kwargs) -> str:
     class _Safe(dict):
-        def __missing__(self, k): 
+        def __missing__(self, k):
             return "{" + k + "}"
+
     return template.format_map(_Safe(**kwargs))
 
 
@@ -155,11 +158,20 @@ def parse_order(payload: dict) -> dict:
         or "cliente"
     )
 
+    # status / payment_* podem vir como int, bool etc → força pra string
+    status_raw = order.get("status") or ""
+    payment_status_raw = order.get("payment_status") or ""
+    payment_method_raw = order.get("payment_method") or ""
+
+    status = str(status_raw).lower()
+    payment_status = str(payment_status_raw).lower()
+    payment_method = str(payment_method_raw).lower()
+
     return {
         "order_id": order.get("id"),
-        "status": (order.get("status") or "").lower(),
-        "payment_status": (order.get("payment_status") or "").lower(),
-        "payment_method": (order.get("payment_method") or "").lower(),
+        "status": status,
+        "payment_status": payment_status,
+        "payment_method": payment_method,
         "checkout_url": checkout_url,
         "name": name,
         "phone": customer.get("phone"),
@@ -176,10 +188,15 @@ async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
 
     try:
         info = parse_order(payload)
-        event = (payload.get("event") or info.get("status") or "").lower()
 
-        payment_method = info.get("payment_method", "")
-        payment_status = info.get("payment_status", "")
+        # event pode vir como string, número ou até dict
+        event_raw = payload.get("event")
+        if isinstance(event_raw, dict):
+            event_raw = event_raw.get("type") or event_raw.get("name") or event_raw
+        event = str(event_raw or info.get("status") or "").lower()
+
+        payment_method = str(info.get("payment_method", "")).lower()
+        payment_status = str(info.get("payment_status", "")).lower()
 
         is_pix = payment_method.startswith("pix")
         is_pending = payment_status in {"pending", "pendente", "aguardando"}
