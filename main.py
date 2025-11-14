@@ -82,6 +82,18 @@ def brl(value) -> str:
         return "R$ 0,00"
 
 
+def to_lower(value: Any) -> str:
+    """
+    Converte QUALQUER coisa pra string minúscula sem quebrar.
+    Até se vier int, bool, etc.
+    """
+    try:
+        s = str(value)
+        return s.lower()
+    except Exception:
+        return ""
+
+
 async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
     headers = {"Client-Token": ZAPI_CLIENT_TOKEN}
     payload = {"phone": phone, "message": message}
@@ -159,13 +171,9 @@ def parse_order(payload: dict) -> dict:
     )
 
     # status / payment_* podem vir como int, bool etc → força pra string
-    status_raw = order.get("status") or ""
-    payment_status_raw = order.get("payment_status") or ""
-    payment_method_raw = order.get("payment_method") or ""
-
-    status = str(status_raw).lower()
-    payment_status = str(payment_status_raw).lower()
-    payment_method = str(payment_method_raw).lower()
+    status = to_lower(order.get("status"))
+    payment_status = to_lower(order.get("payment_status"))
+    payment_method = to_lower(order.get("payment_method"))
 
     return {
         "order_id": order.get("id"),
@@ -193,10 +201,11 @@ async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
         event_raw = payload.get("event")
         if isinstance(event_raw, dict):
             event_raw = event_raw.get("type") or event_raw.get("name") or event_raw
-        event = str(event_raw or info.get("status") or "").lower()
 
-        payment_method = str(info.get("payment_method", "")).lower()
-        payment_status = str(info.get("payment_status", "")).lower()
+        event = to_lower(event_raw or info.get("status"))
+
+        payment_method = to_lower(info.get("payment_method"))
+        payment_status = to_lower(info.get("payment_status"))
 
         is_pix = payment_method.startswith("pix")
         is_pending = payment_status in {"pending", "pendente", "aguardando"}
@@ -268,3 +277,4 @@ def favicon_ico():
 @app.get("/favicon.png")
 def favicon_png():
     return Response(status_code=204)
+
