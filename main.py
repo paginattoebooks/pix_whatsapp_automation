@@ -286,13 +286,14 @@ def check_and_send_if_still_pending(
 
     # 4) chama a função assíncrona de envio (scheduler roda em thread separada)
     try:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(send_whatsapp(phone_norm, msg))
-    loop.close()
-    log.info(f"[{order_id}] WhatsApp (5min) -> {result}")
-except Exception as e:
-    log.exception(f"[{order_id}] erro ao enviar WhatsApp pós-5min: {e}")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(send_whatsapp(phone_norm, msg))
+        loop.close()
+        log.info(f"[{order_id}] WhatsApp (5min) -> {result}")
+   except Exception as e:
+        log.exception(f"[{order_id}] erro ao enviar WhatsApp pós-5min: {e}")
+
 
 
 # ---------------- Webhook ----------------
