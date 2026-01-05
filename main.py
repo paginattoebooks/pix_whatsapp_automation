@@ -17,9 +17,22 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("paginatto-pix")
 
 # ---------------- Env ----------------
-ZAPI_INSTANCE: str = os.getenv("ZAPI_INSTANCE", "")
-ZAPI_TOKEN: str = os.getenv("ZAPI_TOKEN", "")
-ZAPI_CLIENT_TOKEN: str = os.getenv("ZAPI_CLIENT_TOKEN", "")
+UAZAPI_SERVER_URL = os.getenv("UAZAPI_SERVER_URL", "https://free.uazapi.com").rstrip("/")
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
+UAZAPI_ADMIN_TOKEN = os.getenv("UAZAPI_ADMIN_TOKEN", "")
+
+# Caminho do endpoint de envio (depende da UAZAPI). Ex: /message/sendText
+UAZAPI_SEND_PATH = os.getenv("UAZAPI_SEND_PATH", "").strip()
+
+# Como a UAZAPI autentica (depende da doc)
+UAZAPI_AUTH_HEADER = os.getenv("UAZAPI_AUTH_HEADER", "Authorization")
+UAZAPI_AUTH_PREFIX = os.getenv("UAZAPI_AUTH_PREFIX", "Bearer ")
+UAZAPI_TOKEN_KIND = os.getenv("UAZAPI_TOKEN_KIND", "instance").lower().strip()  # instance|admin
+
+# Nomes dos campos no JSON de envio (depende da UAZAPI)
+UAZAPI_TO_FIELD = os.getenv("UAZAPI_TO_FIELD", "phone")     # ou "to" / "number"
+UAZAPI_TEXT_FIELD = os.getenv("UAZAPI_TEXT_FIELD", "message")  # ou "text" / "body"
+
 WHATSAPP_SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
 
 MSG_TEMPLATE: str = os.getenv(
@@ -28,9 +41,6 @@ MSG_TEMPLATE: str = os.getenv(
     "ainda está aguardando pagamento. Se quiser concluir, é só pagar aqui: {checkout_url}"
 )
 
-ZAPI_URL: str = (
-    f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
-)
 
 # ---------------- FastAPI & Scheduler ----------------
 app = FastAPI(title="Paginatto - PIX pendente", version="2.0.0")
@@ -93,24 +103,39 @@ def to_lower(value: Any) -> str:
         return ""
 
 
+def _uazapi_token() -> str:
+    return UAZAPI_ADMIN_TOKEN if UAZAPI_TOKEN_KIND == "admin" else UAZAPI_INSTANCE_TOKEN
+
+
 async def send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
-    headers = {"Client-Token": ZAPI_CLIENT_TOKEN}
-    payload = {"phone": phone, "message": message}
+    if not UAZAPI_SEND_PATH:
+        log.error("ENV UAZAPI_SEND_PATH está vazia. Defina no Render (ex.: /message/sendText).")
+        return {"status": "error", "body": "missing_env:UAZAPI_SEND_PATH"}
+
+    token = _uazapi_token()
+    if not token:
+        log.error("Token UAZAPI vazio. Defina UAZAPI_INSTANCE_TOKEN e/ou UAZAPI_ADMIN_TOKEN no Render.")
+        return {"status": "error", "body": "missing_env:UAZAPI_*_TOKEN"}
+
+    url = f"{UAZAPI_SERVER_URL}{UAZAPI_SEND_PATH}"
+
+    headers = {
+        "Content-Type": "application/json",
+        UAZAPI_AUTH_HEADER: f"{UAZAPI_AUTH_PREFIX}{token}".strip(),
+    }
+
+    payload = {
+        UAZAPI_TO_FIELD: phone,
+        UAZAPI_TEXT_FIELD: message,
+    }
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(ZAPI_URL, headers=headers, json=payload)
+            r = await client.post(url, headers=headers, json=payload)
             return {"status": r.status_code, "body": r.text}
     except Exception as e:
         log.exception(f"Erro ao enviar WhatsApp para {phone}: {e}")
         return {"status": "error", "body": str(e)}
-
-
-def safe_format(template: str, **kwargs) -> str:
-    class _Safe(dict):
-        def __missing__(self, k):
-            return "{" + k + "}"
-
-    return template.format_map(_Safe(**kwargs))
 
 
 # ---------------- Parser (pedido/checkout) ----------------
@@ -261,10 +286,13 @@ def check_and_send_if_still_pending(
 
     # 4) chama a função assíncrona de envio (scheduler roda em thread separada)
     try:
-        result = asyncio.run(send_whatsapp(phone_norm, msg))
-        log.info(f"[{order_id}] WhatsApp (5min) -> {result}")
-    except Exception as e:
-        log.exception(f"[{order_id}] erro ao enviar WhatsApp pós-5min: {e}")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(send_whatsapp(phone_norm, msg))
+    loop.close()
+    log.info(f"[{order_id}] WhatsApp (5min) -> {result}")
+except Exception as e:
+    log.exception(f"[{order_id}] erro ao enviar WhatsApp pós-5min: {e}")
 
 
 # ---------------- Webhook ----------------
