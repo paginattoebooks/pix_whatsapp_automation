@@ -282,7 +282,8 @@ def check_and_send_if_still_pending(
         price=price or "R$ 0,00",
         checkout_url=checkout_url or "#",
         brand=WHATSAPP_SENDER_NAME,
-    )
+)
+
 
     # 4) chama a função assíncrona de envio (scheduler roda em thread separada)
     try:
@@ -354,6 +355,12 @@ async def pix_pendente_webhook(payload: Dict[str, Any] = Body(...)):
     if is_pix and ("order.created" in event or is_pending):
         # agenda checagem para daqui 5 minutos
         run_at = datetime.utcnow() + timedelta(minutes=5)
+
+        def safe_format(template: str, **kwargs) -> str:
+            class _Safe(dict):
+                def __missing__(self, k):
+                    return "{" + k + "}"
+            return (template or "").format_map(_Safe(**kwargs))
 
         try:
             scheduler.add_job(
